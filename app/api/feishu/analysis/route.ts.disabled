@@ -1,0 +1,59 @@
+import { NextResponse } from "next/server"
+import { readFile, writeFile } from "node:fs/promises"
+import { existsSync } from "node:fs"
+
+export const runtime = "nodejs"
+
+const STORE_PATH = "/tmp/feishu-analysis.json"
+type AnalysisPayload = {
+  text: string
+  meta?: Record<string, any>
+}
+
+async function readStore() {
+  if (!existsSync(STORE_PATH)) return null
+  const raw = await readFile(STORE_PATH, "utf-8")
+  return JSON.parse(raw)
+}
+
+async function writeStore(payload: AnalysisPayload) {
+  const record = {
+    text: payload.text || "",
+    meta: payload.meta || {},
+    updatedAt: new Date().toISOString(),
+  }
+  await writeFile(STORE_PATH, JSON.stringify(record), "utf-8")
+  return record
+}
+
+export async function GET() {
+  try {
+    const data = await readStore()
+    if (!data) {
+      return NextResponse.json({ text: "", meta: {} })
+    }
+    return NextResponse.json({
+      text: data.text || "",
+      meta: {
+        ...(data.meta || {}),
+        updatedAt: data.updatedAt,
+      },
+    })
+  } catch (error: any) {
+    return NextResponse.json({ error: error?.message || "读取分析结果失败" }, { status: 500 })
+  }
+}
+
+export async function POST(req: Request) {
+  const body = (await req.json().catch(() => null)) as AnalysisPayload | null
+  if (!body || typeof body.text !== "string") {
+    return NextResponse.json({ error: "请求体缺少text" }, { status: 400 })
+  }
+
+  try {
+    const record = await writeStore(body)
+    return NextResponse.json({ ok: true, updatedAt: record.updatedAt })
+  } catch (error: any) {
+    return NextResponse.json({ error: error?.message || "保存分析结果失败" }, { status: 500 })
+  }
+}

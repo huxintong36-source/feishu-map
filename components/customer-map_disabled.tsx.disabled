@@ -1,0 +1,925 @@
+/**
+ * =====================================================
+ * 客户地图组件 (components/customer-map.tsx)
+ * =====================================================
+ *
+ * 这是整个应用最核心、最复杂的组件
+ * 负责显示地图、客户标记、筛选功能、详情抽屉等所有交互
+ *
+ * 主要功能:
+ * 1. 高德地图显示
+ * 2. 客户点聚合(MarkerCluster)
+ * 3. 筛选功能(客户类型、日均件量、快递公司)
+ * 4. 搜索功能
+ * 5. 客户详情抽屉
+ * 6. 从飞书多维表格实时拉取数据
+ *
+ * 依赖:
+ * - 高德地图 JS API 2.0
+ * - @amap/amap-jsapi-loader
+ * =====================================================
+ */
+
+"use client" // 客户端组件标记
+
+import type React from "react"
+import { useEffect, useState, useRef } from "react"
+import AMapLoader from "@amap/amap-jsapi-loader" // 高德地图加载器
+
+/**
+ * 全局类型声明
+ * 告诉TypeScript: window对象上会有这些高德地图相关的属性
+ */
+declare global {
+  interface Window {
+    AMap: any // 高德地图主对象
+    _AMapSecurityConfig: {
+      securityJsCode: string // 安全密钥
+    }
+  }
+}
+
+/**
+ * 客户数据接口定义
+ * 描述每个客户对象包含哪些字段
+ */
+interface CustomerData {
+  id: string // 唯一标识
+  name: string // 竞品品牌
+  coordinates: [number, number] // 坐标 [经度, 纬度]
+  productName: string // 货品名称
+  dailyVolume: string // 日均件量(字符串)
+  dailyVolumeNum: number // 日均件量(数字)
+  visitCategory: string // 拜访分类(老客户回访/新客开发阶段)
+  mainWeightRange: string // 主要重量段
+  courier: string // 合作快递
+  allPrices: Record<string, Record<string, string>> // 价格详情
+  address: string // 地址
+}
+
+/**
+ * 快递公司Logo映射
+ * 键: 快递公司名称
+ * 值: Logo图片路径(存放在public/images目录)
+ */
+const COURIER_LOGOS: Record<string, string> = {
+  极兔: "/images/jitu.png",
+  申通: "/images/shentong.png",
+  圆通: "/images/yuantong.png",
+  中通: "/images/zhongtong.png",
+  邮政: "/images/youzheng.png",
+  韵达: "/images/yunda.png",
+  德邦: "/images/debang.png",
+  京东: "/images/jingdong.png",
+  顺丰: "/images/shunfeng.png",
+  其他: "", // 其他类型没有logo
+}
+
+/**
+ * 地图主组件
+ */
+export default function CustomerMap() {
+  // ==================== 状态管理 ====================
+
+  /**
+   * useState 说明:
+   * useState(初始值) 返回 [当前值, 修改函数]
+   * 当调用修改函数时,组件会重新渲染
+   */
+
+  // 客户数据
+  const [customers, setCustomers] = useState<CustomerData[]>([]) // 所有客户
+  const [filteredCustomers, setFilteredCustomers] = useState<CustomerData[]>([]) // 筛选后的客户
+
+  // 加载状态
+  const [loading, setLoading] = useState(true) // 数据加载中
+  const [mapReady, setMapReady] = useState(false) // 地图准备就绪
+
+  // 筛选条件
+  const [volumeFilter, setVolumeFilter] = useState<"all" | "below1000" | "above1000">("all") // 件量筛选
+  const [customerTypeFilter, setCustomerTypeFilter] = useState<"all" | "old" | "new">("all") // 客户类型筛选
+  const [courierFilter, setCourierFilter] = useState<string[]>([]) // 快递公司筛选(多选)
+
+  // 搜索
+  const [searchQuery, setSearchQuery] = useState("") // 搜索关键词
+
+  // 菜单开关状态
+  const [filterMenuOpen, setFilterMenuOpen] = useState(false) // 筛选菜单
+  const [statsMenuOpen, setStatsMenuOpen] = useState(false) // 统计信息菜单
+
+  // 详情抽屉
+  const [selectedCustomer, setSelectedCustomer] = useState<CustomerData | null>(null) // 选中的客户
+  const [drawerHeight, setDrawerHeight] = useState(30) // 抽屉高度(百分比)
+  const [isDragging, setIsDragging] = useState(false) // 是否正在拖拽
+
+  /**
+   * useRef 说明:
+   * useRef 创建一个"引用",其值在组件重新渲染时保持不变
+   * 常用于:
+   * 1. 存储DOM元素引用
+   * 2. 存储不需要触发重新渲染的值
+   */
+
+  // DOM引用
+  const mapContainerRef = useRef<HTMLDivElement | null>(null) // 地图容器
+  const drawerRef = useRef<HTMLDivElement>(null) // 抽屉容器
+
+  // 地图相关引用
+  const mapRef = useRef<any>(null) // 高德地图实例
+  const clusterRef = useRef<any>(null) // 点聚合实例
+
+  // 拖拽相关
+  const dragStartY = useRef(0) // 拖拽起始Y坐标
+  const dragStartHeight = useRef(0) // 拖拽起始高度
+
+  // ==================== 事件处理函数 ====================
+
+  /**
+   * 抽屉拖拽开始
+   *
+   * @param e - 触摸或鼠标事件
+   */
+  const handleDragStart = (e: React.TouchEvent | React.MouseEvent) => {
+    e.stopPropagation() // 阻止事件冒泡
+    setIsDragging(true)
+
+    // 获取起始Y坐标(兼容触摸和鼠标)
+    const clientY = "touches" in e ? e.touches[0].clientY : e.clientY
+    dragStartY.current = clientY
+    dragStartHeight.current = drawerHeight
+  }
+
+  /**
+   * 抽屉拖拽移动
+   *
+   * @param e - 触摸或鼠标事件
+   */
+  const handleDragMove = (e: TouchEvent | MouseEvent) => {
+    if (!isDragging) return
+
+    const clientY = "touches" in e ? e.touches[0].clientY : e.clientY
+    const deltaY = dragStartY.current - clientY // 移动距离
+    const windowHeight = window.innerHeight
+    const deltaPercent = (deltaY / windowHeight) * 100 // 转换为百分比
+
+    // 限制高度范围: 20% ~ 80%
+    const newHeight = Math.min(80, Math.max(20, dragStartHeight.current + deltaPercent))
+    setDrawerHeight(newHeight)
+  }
+
+  /**
+   * 抽屉拖拽结束
+   */
+  const handleDragEnd = () => {
+    setIsDragging(false)
+    // 如果高度太小,关闭抽屉
+    if (drawerHeight < 25) {
+      setSelectedCustomer(null)
+    }
+  }
+
+  /**
+   * 切换快递公司筛选
+   * 如果已选中则取消,未选中则添加
+   */
+  const toggleCourierFilter = (courier: string) => {
+    setCourierFilter((prev) =>
+      prev.includes(courier) ? prev.filter((c) => c !== courier) : [...prev, courier]
+    )
+  }
+
+  // 快递公司列表
+  const COURIERS = ["全部类型", "极兔", "申通", "圆通", "中通", "邮政", "韵达", "德邦", "京东", "顺丰", "其他"]
+
+  /**
+   * 初始化高德地图
+   * 当数据加载完成后,初始化地图
+   */
+  useEffect(() => {
+    // 检查是否需要初始化
+    if (typeof window === "undefined" || mapRef.current || !mapContainerRef.current || loading) {
+      return
+    }
+
+    // 设置高德地图安全密钥
+    window._AMapSecurityConfig = {
+      securityJsCode: "bb4373f919acdcdbc148db02df8e0bed",
+    }
+
+    console.log("Loading AMap...")
+
+    // 加载高德地图
+    AMapLoader.load({
+      key: "36d7f36a1aacfc97c95542d3fc872b6e", // 高德地图API Key
+      version: "2.0", // API版本
+      plugins: ["AMap.MarkerCluster", "AMap.DistrictSearch"], // 加载的插件
+    })
+      .then((AMap) => {
+        console.log("AMap loaded successfully")
+
+        // 创建地图实例
+        const map = new AMap.Map(mapContainerRef.current, {
+          zoom: 7, // 初始缩放级别
+          center: [113.65, 34.76], // 初始中心点(郑州)
+          viewMode: "2D", // 2D模式
+        })
+
+        mapRef.current = map
+
+        // 创建行政区查询对象,用于绘制省份边界
+        const district = new AMap.DistrictSearch({
+          extensions: "all", // 返回完整数据
+          subdistrict: 1, // 获取第一级子区域(省)
+        })
+
+        // 搜索中国,获取所有省份
+        district.search("中国", (status: string, result: any) => {
+          if (status === "complete" && result.districtList[0]?.districtList) {
+            const provinces = result.districtList[0].districtList
+
+            // 遍历每个省份
+            provinces.forEach((province: any) => {
+              // 绘制省份边界线
+              if (province.boundaries) {
+                province.boundaries.forEach((boundary: any) => {
+                  const polygon = new AMap.Polygon({
+                    path: boundary,
+                    strokeColor: "#0088ff", // 蓝色边框
+                    strokeWeight: 1.5, // 线宽
+                    strokeOpacity: 0.6, // 透明度
+                    fillColor: "transparent", // 无填充
+                    fillOpacity: 0,
+                  })
+                  polygon.setMap(map)
+                })
+              }
+
+              // 为每个省份查询城市边界
+              const cityDistrict = new AMap.DistrictSearch({
+                extensions: "all",
+                level: "city",
+              })
+
+              cityDistrict.search(province.adcode, (cityStatus: string, cityResult: any) => {
+                if (cityStatus === "complete" && cityResult.districtList[0]?.districtList) {
+                  const cities = cityResult.districtList[0].districtList
+
+                  // 绘制城市边界线
+                  cities.forEach((city: any) => {
+                    if (city.boundaries) {
+                      city.boundaries.forEach((boundary: any) => {
+                        const polygon = new AMap.Polygon({
+                          path: boundary,
+                          strokeColor: "#888888", // 灰色边框
+                          strokeWeight: 0.8, // 更细的线
+                          strokeOpacity: 0.4, // 更透明
+                          fillColor: "transparent",
+                          fillOpacity: 0,
+                        })
+                        polygon.setMap(map)
+                      })
+                    }
+                  })
+                }
+              })
+            })
+          }
+        })
+
+        setMapReady(true)
+        console.log("Map initialized with city boundaries")
+      })
+      .catch((error) => {
+        console.error("Error loading AMap:", error)
+        setLoading(false)
+      })
+
+    // 清理函数: 组件卸载时销毁地图
+    return () => {
+      if (mapRef.current) {
+        mapRef.current.destroy()
+        mapRef.current = null
+      }
+    }
+  }, [loading])
+
+  /**
+   * 创建点聚合
+   * 当地图就绪且有客户数据时,创建点聚合
+   */
+  useEffect(() => {
+    if (!mapReady || !mapRef.current || !filteredCustomers.length) {
+      console.log("Skipping cluster - mapReady:", mapReady, "customers:", filteredCustomers.length)
+      // 清除已有的聚合
+      if (clusterRef.current) {
+        clusterRef.current.setMap(null)
+        clusterRef.current = null
+      }
+      return
+    }
+
+    const AMap = window.AMap
+    if (!AMap) {
+      console.log("AMap not available")
+      return
+    }
+
+    // 清除已有的聚合
+    if (clusterRef.current) {
+      clusterRef.current.setMap(null)
+    }
+
+    console.log("Creating marker cluster with", filteredCustomers.length, "points")
+
+    // 准备点数据
+    const points = filteredCustomers.map((customer) => ({
+      lnglat: customer.coordinates,
+      weight: customer.dailyVolumeNum, // 权重
+      name: customer.name,
+      ...customer,
+    }))
+
+    /**
+     * 自定义聚合点渲染函数
+     * 当多个点聚合在一起时,显示为一个带数字的圆形
+     */
+    const renderClusterMarker = (context: any) => {
+      const count = context.count // 聚合的点数量
+      const div = document.createElement("div")
+
+      // 根据数量选择颜色(从浅绿到深蓝)
+      const colors = ["204,235,197", "168,221,181", "123,204,196", "78,179,211", "43,140,190"]
+      let bgColor = colors[0]
+      if (count >= 10000) bgColor = colors[4]
+      else if (count >= 1000) bgColor = colors[3]
+      else if (count >= 100) bgColor = colors[2]
+      else if (count >= 10) bgColor = colors[1]
+
+      // 根据数量计算大小
+      const size = Math.round(30 + Math.pow(count / filteredCustomers.length, 1 / 5) * 50)
+
+      // 设置样式
+      div.style.backgroundColor = `rgba(${bgColor}, 0.7)`
+      div.style.width = `${size}px`
+      div.style.height = `${size}px`
+      div.style.border = `solid 2px rgba(${bgColor}, 1)`
+      div.style.borderRadius = `${size / 2}px`
+      div.innerHTML = count.toString()
+      div.style.lineHeight = `${size}px`
+      div.style.color = "#ffffff"
+      div.style.fontSize = "14px"
+      div.style.fontWeight = "bold"
+      div.style.textAlign = "center"
+      div.style.cursor = "pointer"
+
+      context.marker.setOffset(new AMap.Pixel(-size / 2, -size / 2))
+      context.marker.setContent(div)
+
+      // 点击聚合点时放大地图
+      context.marker.on("click", (e: any) => {
+        const clusterData = context.clusterData
+        if (clusterData && clusterData.length > 0) {
+          console.log("Cluster clicked with", clusterData.length, "items")
+
+          if (e && e.lnglat) {
+            const centerLng = e.lnglat.lng
+            const centerLat = e.lnglat.lat
+            console.log("Zooming in to center:", [centerLng, centerLat])
+
+            // 放大3级并移动到聚合点中心
+            const currentZoom = mapRef.current.getZoom()
+            mapRef.current.setZoomAndCenter(currentZoom + 3, [centerLng, centerLat], false, 500)
+          } else {
+            console.error("Click event missing lnglat property")
+          }
+        }
+      })
+    }
+
+    /**
+     * 自定义单个标记渲染函数
+     * 当点不聚合时,显示为钉子形状的图标
+     */
+    const renderMarker = (context: any) => {
+      const customer = context.data[0]
+      const pinSize = 28
+
+      // 根据客户类型选择颜色
+      let pinColor = "#3b82f6" // 新客户: 蓝色
+      if (customer.visitCategory === "老客户回访") {
+        pinColor = "#ef4444" // 老客户: 红色
+      }
+
+      // 创建钉子图标
+      const div = document.createElement("div")
+      div.style.position = "relative"
+      div.style.width = `${pinSize}px`
+      div.style.height = `${pinSize * 1.2}px`
+      div.style.cursor = "pointer"
+
+      // SVG钉子形状
+      div.innerHTML = `
+        <svg width="${pinSize}" height="${pinSize * 1.2}" viewBox="0 0 24 32" xmlns="http://www.w3.org/2000/svg">
+          <path d="M12 0C7.6 0 4 3.6 4 8c0 5.4 8 16 8 16s8-10.6 8-16c0-4.4-3.6-8-8-8z" 
+                fill="${pinColor}" 
+                stroke="white" 
+                strokeWidth="1.5"
+                filter="drop-shadow(0 2px 4px rgba(0,0,0,0.3))"/>
+          <circle cx="12" cy="8" r="4" fill="white"/>
+        </svg>
+      `
+
+      // 创建悬浮提示框(显示快递公司logo)
+      const tooltip = document.createElement("div")
+      tooltip.style.position = "absolute"
+      tooltip.style.bottom = "100%"
+      tooltip.style.left = "50%"
+      tooltip.style.transform = "translateX(-50%)"
+      tooltip.style.marginBottom = "4px"
+      tooltip.style.padding = "4px 8px"
+      tooltip.style.backgroundColor = "white"
+      tooltip.style.border = "2px solid " + pinColor
+      tooltip.style.borderRadius = "6px"
+      tooltip.style.boxShadow = "0 2px 8px rgba(0,0,0,0.15)"
+      tooltip.style.display = "none"
+      tooltip.style.whiteSpace = "nowrap"
+      tooltip.style.zIndex = "1000"
+      tooltip.style.fontSize = "20px"
+
+      // 解析快递公司并生成logo
+      const courierNames = customer.courier.split(/[、,，]/).map((c: string) => c.trim())
+      const logos = courierNames
+        .map((name: string) => {
+          const logoUrl = COURIER_LOGOS[name]
+          if (logoUrl) {
+            return `<img src="${logoUrl}" alt="${name}" style="height: 24px; width: auto; object-fit: contain; display: inline-block; vertical-align: middle;" />`
+          }
+          return `<span style="font-size: 12px; vertical-align: middle;">${name}</span>`
+        })
+        .join(" ")
+      tooltip.innerHTML = logos
+      tooltip.style.display = "none"
+      tooltip.style.flexDirection = "row"
+      tooltip.style.alignItems = "center"
+      tooltip.style.gap = "4px"
+
+      div.appendChild(tooltip)
+
+      // 鼠标悬浮显示提示框
+      div.addEventListener("mouseenter", () => {
+        tooltip.style.display = "block"
+      })
+      div.addEventListener("mouseleave", () => {
+        tooltip.style.display = "none"
+      })
+
+      context.marker.setOffset(new AMap.Pixel(-pinSize / 2, -pinSize * 1.2))
+      context.marker.setContent(div)
+
+      // 点击标记打开详情抽屉
+      context.marker.on("click", () => {
+        setSelectedCustomer(customer)
+        setDrawerHeight(30)
+      })
+    }
+
+    // 创建点聚合
+    const cluster = new AMap.MarkerCluster(mapRef.current, points, {
+      gridSize: 80, // 聚合网格大小
+      renderClusterMarker: renderClusterMarker,
+      renderMarker: renderMarker,
+    })
+
+    clusterRef.current = cluster
+    console.log("Marker cluster created")
+  }, [mapReady, filteredCustomers])
+
+  /**
+   * 监听抽屉拖拽事件
+   */
+  useEffect(() => {
+    if (!selectedCustomer) return
+
+    const handleMove = (e: TouchEvent | MouseEvent) => handleDragMove(e)
+    const handleEnd = () => handleDragEnd()
+
+    // 添加事件监听
+    document.addEventListener("touchmove", handleMove, { passive: false })
+    document.addEventListener("mousemove", handleMove)
+    document.addEventListener("touchend", handleEnd)
+    document.addEventListener("mouseup", handleEnd)
+
+    // 清理函数
+    return () => {
+      document.removeEventListener("touchmove", handleMove)
+      document.removeEventListener("mousemove", handleMove)
+      document.removeEventListener("touchend", handleEnd)
+      document.removeEventListener("mouseup", handleEnd)
+    }
+  }, [selectedCustomer, isDragging, drawerHeight])
+
+  // ==================== 加载客户数据 ====================
+
+  useEffect(() => {
+    const parseCSVData = async () => {
+      try {
+        console.log("Fetching customer data...")
+
+        // 调用客户数据API
+        const response = await fetch("/api/customer-data")
+        const data = await response.json()
+
+        if (data && data.customers) {
+          console.log("Loaded", data.customers.length, "customers")
+          setCustomers(data.customers)
+          setFilteredCustomers(data.customers)
+        }
+        setLoading(false)
+      } catch (error) {
+        console.error("Error fetching customer data:", error)
+        setLoading(false)
+      }
+    }
+
+    parseCSVData()
+  }, []) // 空依赖数组: 只执行一次
+
+  // ==================== 筛选逻辑 ====================
+
+  useEffect(() => {
+    let filtered = customers
+
+    // 1. 搜索筛选
+    if (searchQuery.trim()) {
+      const query = searchQuery.toLowerCase()
+      filtered = filtered.filter((customer) => {
+        // 搜索多个字段
+        return (
+          customer.name.toLowerCase().includes(query) ||
+          customer.productName.toLowerCase().includes(query) ||
+          customer.courier.toLowerCase().includes(query) ||
+          customer.visitCategory.toLowerCase().includes(query) ||
+          customer.mainWeightRange.toLowerCase().includes(query) ||
+          customer.address.toLowerCase().includes(query) ||
+          customer.dailyVolume.toLowerCase().includes(query)
+        )
+      })
+    }
+
+    // 2. 日均件量筛选
+    if (volumeFilter === "below1000") {
+      filtered = filtered.filter((c) => c.dailyVolumeNum < 1000)
+    } else if (volumeFilter === "above1000") {
+      filtered = filtered.filter((c) => c.dailyVolumeNum >= 1000)
+    }
+
+    // 3. 客户类型筛选
+    if (customerTypeFilter === "old") {
+      filtered = filtered.filter((c) => c.visitCategory === "老客户回访")
+    } else if (customerTypeFilter === "new") {
+      filtered = filtered.filter((c) => c.visitCategory === "新客开发阶段")
+    }
+
+    // 4. 快递公司筛选(支持多选)
+    if (courierFilter.length > 0) {
+      filtered = filtered.filter((c) => {
+        // 将客户的快递字段拆分为数组(支持"极兔、申通"这种格式)
+        const customerCouriers = c.courier.split(/[、,，]/).map((name) => name.trim())
+        // 检查是否包含任一选中的快递
+        return courierFilter.some((selectedCourier) => customerCouriers.includes(selectedCourier))
+      })
+    }
+
+    setFilteredCustomers(filtered)
+  }, [volumeFilter, customerTypeFilter, courierFilter, customers, searchQuery])
+
+  // ==================== 计算属性 ====================
+
+  // 计算当前激活的筛选条件数量(用于显示角标)
+  const activeFilterCount =
+    (customerTypeFilter !== "all" ? 1 : 0) + (volumeFilter !== "all" ? 1 : 0) + courierFilter.length
+
+  // 统计信息
+  const stats = {
+    total: filteredCustomers.length,
+    totalVolume: filteredCustomers.reduce((sum, c) => sum + c.dailyVolumeNum, 0),
+  }
+
+  // ==================== 渲染 ====================
+
+  // 加载中显示
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center h-screen bg-background">
+        <div className="text-center">
+          <div className="inline-block animate-spin rounded-full h-12 w-12 border-b-2 border-primary mb-4"></div>
+          <div className="text-sm font-medium">正在加载地图...</div>
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <div className="relative w-full h-screen overflow-hidden">
+      {/* ==================== 地图容器 ==================== */}
+      <div ref={mapContainerRef} id="map-container" className="absolute inset-0 w-full h-full" />
+
+      {/* ==================== 顶部工具栏 ==================== */}
+      <div className="absolute top-6 left-3 right-3 z-10 flex items-center gap-2">
+        {/* 统计信息按钮 */}
+        <button
+          onClick={() => {
+            setStatsMenuOpen(!statsMenuOpen)
+            setFilterMenuOpen(false)
+          }}
+          className={`w-9 h-9 bg-white/95 backdrop-blur-sm rounded-full shadow-lg flex items-center justify-center hover:scale-105 transition-all active:scale-95 flex-shrink-0 ${
+            statsMenuOpen ? "bg-gray-200" : ""
+          }`}
+        >
+          {/* 柱状图图标 */}
+          <svg
+            xmlns="http://www.w3.org/2000/svg"
+            className="h-4 w-4"
+            fill="none"
+            viewBox="0 0 24 24"
+            stroke="currentColor"
+          >
+            <path
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              strokeWidth={2}
+              d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"
+            />
+          </svg>
+        </button>
+
+        {/* 搜索框 */}
+        <div className="flex-1 bg-white/95 backdrop-blur-sm rounded-full shadow-lg">
+          <input
+            type="text"
+            placeholder="搜索任意关键词..."
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            className="w-full text-xs border-0 bg-transparent focus:outline-none placeholder:text-gray-400 px-3 py-1.5"
+          />
+          {/* 显示搜索结果数量 */}
+          {searchQuery && (
+            <div className="px-3 pb-1.5 text-[9px] text-gray-500">找到 {filteredCustomers.length} 个结果</div>
+          )}
+        </div>
+
+        {/* 筛选按钮 */}
+        <button
+          onClick={() => {
+            setFilterMenuOpen(!filterMenuOpen)
+            setStatsMenuOpen(false)
+          }}
+          className={`relative w-9 h-9 bg-white/95 backdrop-blur-sm rounded-full shadow-lg flex items-center justify-center hover:scale-105 transition-all active:scale-95 flex-shrink-0 ${
+            filterMenuOpen ? "bg-gray-200" : ""
+          }`}
+        >
+          {/* 滑块图标 */}
+          <svg
+            xmlns="http://www.w3.org/2000/svg"
+            className="h-4 w-4"
+            fill="none"
+            viewBox="0 0 24 24"
+            stroke="currentColor"
+          >
+            <path
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              strokeWidth={2}
+              d="M12 6V4m0 2a2 2 0 100 4m0-4a2 2 0 110 4m-6 8a2 2 0 100-4m0 4a2 2 0 110 4m0 4v2m0-6V4m6 6v10m6-2a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4"
+            />
+          </svg>
+          {/* 筛选数量角标 */}
+          {activeFilterCount > 0 && (
+            <span className="absolute -top-0.5 -right-0.5 bg-red-500 text-white text-[9px] font-bold rounded-full w-3.5 h-3.5 flex items-center justify-center">
+              {activeFilterCount}
+            </span>
+          )}
+        </button>
+      </div>
+
+      {/* ==================== 统计信息下拉菜单 ==================== */}
+      {statsMenuOpen && (
+        <>
+          {/* 点击背景关闭菜单 */}
+          <div className="fixed inset-0 z-10" onClick={() => setStatsMenuOpen(false)} />
+          <div className="absolute top-14 left-3 bg-white/95 backdrop-blur-sm rounded-lg shadow-xl p-3 space-y-2 min-w-[140px] z-20">
+            <div className="text-xs text-gray-600">客户总数</div>
+            <div className="text-lg font-bold text-blue-600">{stats.total}</div>
+            <div className="text-xs text-gray-600 mt-2">总日均件量</div>
+            <div className="text-lg font-bold text-green-600">{stats.totalVolume.toLocaleString()}</div>
+          </div>
+        </>
+      )}
+
+      {/* ==================== 筛选下拉菜单 ==================== */}
+      {filterMenuOpen && (
+        <>
+          <div className="fixed inset-0 z-10" onClick={() => setFilterMenuOpen(false)} />
+          <div className="absolute top-14 right-3 bg-white/95 backdrop-blur-sm rounded-lg shadow-xl p-3 space-y-2 w-48 z-20">
+            {/* 客户类型筛选 */}
+            <div className="text-xs font-semibold mb-2">客户类型</div>
+            <div className="space-y-1">
+              {["all", "old", "new"].map((type) => (
+                <button
+                  key={type}
+                  onClick={() => setCustomerTypeFilter(type as any)}
+                  className={`w-full text-left px-2 py-1.5 text-xs rounded transition-colors ${
+                    customerTypeFilter === type ? "bg-blue-500 text-white" : "bg-gray-100 hover:bg-gray-200"
+                  }`}
+                >
+                  {type === "all" ? "全部" : type === "old" ? "老客户" : "新客户"}
+                </button>
+              ))}
+            </div>
+
+            {/* 日均件量筛选 */}
+            <div className="text-xs font-semibold mb-2 mt-3">日均件量</div>
+            <div className="space-y-1">
+              {["all", "below1000", "above1000"].map((vol) => (
+                <button
+                  key={vol}
+                  onClick={() => setVolumeFilter(vol as any)}
+                  className={`w-full text-left px-2 py-1.5 text-xs rounded transition-colors ${
+                    volumeFilter === vol ? "bg-blue-500 text-white" : "bg-gray-100 hover:bg-gray-200"
+                  }`}
+                >
+                  {vol === "all" ? "全部" : vol === "below1000" ? "<1000件" : ">=1000件"}
+                </button>
+              ))}
+            </div>
+
+            {/* 合作快递筛选 */}
+            <div className="text-xs font-semibold mb-2 mt-3">合作快递</div>
+            <div className="space-y-1 max-h-40 overflow-y-auto">
+              {COURIERS.map((courier) => (
+                <button
+                  key={courier}
+                  onClick={() => {
+                    if (courier === "全部类型") {
+                      setCourierFilter([]) // 清空筛选
+                    } else {
+                      toggleCourierFilter(courier)
+                    }
+                  }}
+                  className={`w-full text-left px-2 py-1.5 text-xs rounded transition-colors ${
+                    courier === "全部类型"
+                      ? courierFilter.length === 0
+                        ? "bg-blue-500 text-white"
+                        : "bg-gray-100 hover:bg-gray-200"
+                      : courierFilter.includes(courier)
+                        ? "bg-blue-500 text-white"
+                        : "bg-gray-100 hover:bg-gray-200"
+                  }`}
+                >
+                  {courier}
+                </button>
+              ))}
+            </div>
+          </div>
+        </>
+      )}
+
+      {/* ==================== 客户详情抽屉 ==================== */}
+      {selectedCustomer && (
+        <>
+          {/* 背景遮罩 */}
+          <div className="absolute inset-0 bg-black/20 z-40" onClick={() => setSelectedCustomer(null)} />
+
+          {/* 抽屉面板 */}
+          <div
+            ref={drawerRef}
+            className="absolute bottom-0 left-1/2 -translate-x-1/2 w-full max-w-2xl bg-white rounded-t-2xl shadow-2xl z-60"
+            style={{
+              height: `${drawerHeight}%`,
+              maxHeight: "90vh",
+              minHeight: "20vh",
+              transition: isDragging ? "none" : "height 0.3s ease",
+            }}
+            onTouchStart={handleDragStart}
+            onMouseDown={handleDragStart}
+          >
+            {/* 拖拽手柄 */}
+            <div className="w-full py-3 flex justify-center cursor-grab active:cursor-grabbing">
+              <div className="w-12 h-1 bg-gray-300 rounded-full" />
+            </div>
+
+            {/* 关闭按钮 */}
+            <button
+              onClick={() => setSelectedCustomer(null)}
+              className="absolute top-3 right-3 w-8 h-8 bg-gray-100 hover:bg-gray-200 rounded-full flex items-center justify-center transition-colors z-10"
+            >
+              <svg
+                xmlns="http://www.w3.org/2000/svg"
+                className="h-5 w-5"
+                fill="none"
+                viewBox="0 0 24 24"
+                stroke="currentColor"
+              >
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+              </svg>
+            </button>
+
+            {/* 抽屉内容 */}
+            <div
+              className="px-4 pb-4 overflow-y-auto"
+              style={{
+                height: "calc(100% - 48px)",
+                transition: "none",
+              }}
+            >
+              {/* 客户名称 */}
+              <h3 className="text-base font-bold mb-3">{selectedCustomer.name}</h3>
+
+              {/* 基本信息列表 */}
+              <div className="space-y-2 text-sm">
+                <div className="flex justify-between py-2 border-b">
+                  <span className="text-gray-600">货品名称</span>
+                  <span className="font-medium">{selectedCustomer.productName}</span>
+                </div>
+                <div className="flex justify-between py-2 border-b">
+                  <span className="text-gray-600">日均件量</span>
+                  <span className="font-medium text-blue-600">{selectedCustomer.dailyVolume} 件</span>
+                </div>
+                <div className="flex justify-between py-2 border-b">
+                  <span className="text-gray-600">主要重量段</span>
+                  <span className="font-medium">{selectedCustomer.mainWeightRange}</span>
+                </div>
+                <div className="flex justify-between py-2 border-b">
+                  <span className="text-gray-600">客户类型</span>
+                  <span
+                    className={`font-medium ${
+                      selectedCustomer.visitCategory === "老客户回访" ? "text-red-600" : "text-blue-600"
+                    }`}
+                  >
+                    {selectedCustomer.visitCategory}
+                  </span>
+                </div>
+                {/* 合作快递(带logo) */}
+                <div className="flex justify-between py-2 border-b">
+                  <span className="text-gray-600">合作快递</span>
+                  <div className="flex items-center gap-1.5 flex-wrap justify-end">
+                    {selectedCustomer.courier.split(/[、,，]/).map((name, idx) => {
+                      const logoUrl = COURIER_LOGOS[name.trim()]
+                      return logoUrl ? (
+                        <img
+                          key={idx}
+                          src={logoUrl || "/placeholder.svg"}
+                          alt={name.trim()}
+                          className="h-5 w-auto object-contain"
+                        />
+                      ) : (
+                        <span key={idx} className="font-medium text-xs">
+                          {name.trim()}
+                        </span>
+                      )
+                    })}
+                  </div>
+                </div>
+                <div className="flex justify-between py-2 border-b">
+                  <span className="text-gray-600">地址</span>
+                  <span className="font-medium text-right max-w-[60%]">{selectedCustomer.address}</span>
+                </div>
+              </div>
+
+              {/* 价格详情 */}
+              <div className="mt-4">
+                <h4 className="text-sm font-semibold mb-2 text-gray-700">价格详情</h4>
+                <div className="space-y-3">
+                  {Object.entries(selectedCustomer.allPrices).map(([courier, prices]) => (
+                    <div key={courier} className="bg-gray-50 rounded-lg p-3">
+                      {/* 快递公司名称(带logo) */}
+                      <div className="font-medium text-sm mb-2 flex items-center gap-2">
+                        {COURIER_LOGOS[courier] ? (
+                          <img
+                            src={COURIER_LOGOS[courier] || "/placeholder.svg"}
+                            alt={courier}
+                            className="h-5 w-auto object-contain"
+                          />
+                        ) : null}
+                        <span>{courier}</span>
+                      </div>
+                      {/* 价格表格 */}
+                      <div className="grid grid-cols-2 gap-2">
+                        {Object.entries(prices).map(([range, price]) => (
+                          <div key={range} className="text-xs">
+                            <span className="text-gray-600">{range}: </span>
+                            <span className="font-medium text-green-600">{price}元/件</span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          </div>
+        </>
+      )}
+    </div>
+  )
+}

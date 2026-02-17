@@ -1,0 +1,291 @@
+/**
+ * =====================================================
+ * 客户数据API (app/api/customer-data/route.ts)
+ * =====================================================
+ * 
+ * 这是后端API，从飞书多维表格实时拉取客户数据
+ * 
+ * 【数据来源】飞书多维表格
+ * 
+ * 访问方式: GET /api/customer-data
+ * 返回格式: JSON { customers: [...], stats: { total, totalVolume } }
+ * 
+ * 飞书API调用流程:
+ * 1. 用 App ID + App Secret 获取 tenant_access_token
+ * 2. 用 token 调用多维表格API获取记录
+ * =====================================================
+ */
+
+import { NextResponse } from "next/server"
+
+// 飞书API基础URL
+const FEISHU_API_BASE = "https://open.feishu.cn/open-apis"
+
+// 检查必需的环境变量
+function getMissingEnvVars(): string[] {
+  const required = [
+    "FEISHU_APP_ID",
+    "FEISHU_APP_SECRET",
+    "FEISHU_APP_TOKEN",
+    "FEISHU_TABLE_ID",
+  ]
+
+  return required.filter((k) => !process.env[k])
+}
+
+/**
+ * 获取飞书访问令牌 (tenant_access_token)
+ */
+async function getAccessToken(): Promise<string> {
+  const response = await fetch(`${FEISHU_API_BASE}/auth/v3/tenant_access_token/internal`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      app_id: process.env.FEISHU_APP_ID,
+      app_secret: process.env.FEISHU_APP_SECRET,
+    }),
+  })
+
+  const data = await response.json()
+  
+  if (data.code !== 0) {
+    throw new Error(`获取飞书token失败: ${data.msg}`)
+  }
+
+  return data.tenant_access_token
+}
+
+/**
+ * 从飞书多维表格获取所有记录
+ */
+async function getTableRecords(token: string): Promise<any[]> {
+  const appToken = process.env.FEISHU_APP_TOKEN
+  const tableId = process.env.FEISHU_TABLE_ID
+  
+  const allRecords: any[] = []
+  let pageToken = ""
+  
+  do {
+    const url = `${FEISHU_API_BASE}/bitable/v1/apps/${appToken}/tables/${tableId}/records?page_size=500${pageToken ? `&page_token=${pageToken}` : ""}`
+    
+    const response = await fetch(url, {
+      method: "GET",
+      headers: {
+        "Authorization": `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+    })
+
+    const data = await response.json()
+    
+    if (data.code !== 0) {
+      throw new Error(`获取飞书数据失败: ${data.msg}`)
+    }
+
+    if (data.data?.items) {
+      allRecords.push(...data.data.items)
+    }
+
+    pageToken = data.data?.page_token || ""
+    
+  } while (pageToken)
+
+  return allRecords
+}
+
+/**
+ * 将飞书记录转换为客户数据格式
+ * 
+ * 飞书多维表格字段格式说明:
+ * - 文本字段: 直接是字符串
+ * - 多选字段: 数组 ["选项1", "选项2"]
+ * - 富文本字段: 数组 [{text: "内容", type: "text"}]
+ * - 地理位置字段: 对象 {location: "经度,纬度", address: "地址"}
+ * - 人员字段: 对象 {name: "姓名", id: "xxx"}
+ */
+function transformRecord(record: any, index: number): any | null {
+  const fields = record.fields
+
+  // ========== 提取客户名称 ==========
+  const name = fields["客户企业名称"] || ""
+  if (!name || typeof name !== "string") {
+    return null
+  }
+
+  // ========== 提取经纬度 ==========
+  let coords = ""
+  
+  // 优先从"客户地址（定位）"字段获取（更准确）
+  const locationField = fields["客户地址（定位）"]
+  if (locationField && locationField.location) {
+    coords = locationField.location
+  }
+  // 备选：从"客户地址经纬度"字段获取
+  else if (fields["客户地址经纬度"]) {
+    const coordField = fields["客户地址经纬度"]
+    if (Array.isArray(coordField) && coordField[0]?.text) {
+      coords = coordField[0].text
+    } else if (typeof coordField === "string") {
+      coords = coordField
+    }
+  }
+
+  if (!coords) {
+    return null
+  }
+
+  // 解析经纬度
+  const coordMatch = coords.match(/([0-9.]+)[,，]\s*([0-9.]+)/)
+  if (!coordMatch) {
+    return null
+  }
+
+  const lng = parseFloat(coordMatch[1])
+  const lat = parseFloat(coordMatch[2])
+
+  // 验证坐标范围（中国大致范围）
+  if (lat < 18 || lat > 54 || lng < 73 || lng > 135) {
+    return null
+  }
+
+  // ========== 提取日均件量 ==========
+  let dailyVolume = 0
+  const volumeField = fields["客户日均件量数（件）"]
+  if (volumeField) {
+    if (typeof volumeField === "number") {
+      dailyVolume = volumeField
+    } else if (typeof volumeField === "string") {
+      dailyVolume = parseInt(volumeField) || 0
+    }
+  }
+
+  // ========== 提取拜访分类 ==========
+  const visitCategory = fields["拜访分类"] || "未知"
+
+  // ========== 提取合作快递（多选字段，是数组） ==========
+  let courier = "其他"
+  const courierField = fields["合作快递"]
+  if (Array.isArray(courierField) && courierField.length > 0) {
+    courier = courierField.join("、")
+  } else if (typeof courierField === "string") {
+    courier = courierField
+  }
+
+  // ========== 提取主要重量段（多选字段） ==========
+  let mainWeightRange = "未知"
+  const weightField = fields["主要重量段"]
+  if (Array.isArray(weightField) && weightField.length > 0) {
+    mainWeightRange = weightField.join("、")
+  } else if (typeof weightField === "string") {
+    mainWeightRange = weightField
+  }
+
+  // ========== 提取货品名称 ==========
+  const productName = fields["货品名称与价格"] || "未知"
+
+  // ========== 提取地址 ==========
+  let address = ""
+  if (locationField && locationField.full_address) {
+    address = locationField.full_address
+  } else if (locationField && locationField.address) {
+    address = `${locationField.pname || ""}${locationField.cityname || ""}${locationField.adname || ""}${locationField.address || ""}`
+  }
+
+  // ========== 提取价格信息 ==========
+  const allPrices: Record<string, Record<string, string>> = {}
+  const courierNames = ["极兔", "申通", "韵达", "圆通", "中通", "邮政", "京东", "顺丰", "德邦"]
+  const weightRanges = ["0-0.3kg", "0.3-0.5kg", "0.5-1.0kg", "1.0-2.0kg", "2.0-3.0kg", "3.0kg以上"]
+  
+  courierNames.forEach(courierName => {
+    const prices: Record<string, string> = {}
+    weightRanges.forEach(range => {
+      // 飞书字段名格式: "极兔价格-0.3-0.5kg"
+      const fieldName = `${courierName}价格-${range}`
+      const price = fields[fieldName]
+      if (price !== undefined && price !== null && price !== "") {
+        prices[range] = String(price)
+      }
+    })
+    if (Object.keys(prices).length > 0) {
+      allPrices[courierName] = prices
+    }
+  })
+
+  return {
+    id: record.record_id || `customer-${index}`,
+    name,
+    coordinates: [lng, lat] as [number, number],
+    productName,
+    dailyVolume: String(dailyVolume),
+    dailyVolumeNum: dailyVolume,
+    visitCategory,
+    mainWeightRange,
+    courier,
+    allPrices,
+    address,
+  }
+}
+
+/**
+ * GET请求处理函数
+ */
+export async function GET() {
+  try {
+    console.log("开始从飞书获取数据...")
+
+    // 在尝试调用飞书 API 之前，先确保必要的 env 已配置
+    const missing = getMissingEnvVars()
+    if (missing.length) {
+      const msg = `缺少环境变量: ${missing.join(", ")}. 请复制 .env.local.example 到 .env.local 并填写对应值.`
+      console.error("环境变量缺失:", msg)
+      return NextResponse.json(
+        {
+          error: msg,
+          customers: [],
+          stats: { total: 0, totalVolume: 0 },
+        },
+        { status: 400 }
+      )
+    }
+
+    const token = await getAccessToken()
+    console.log("成功获取飞书token")
+
+    const records = await getTableRecords(token)
+    console.log(`获取到 ${records.length} 条记录`)
+
+    const customers = []
+    let totalVolume = 0
+
+    for (let i = 0; i < records.length; i++) {
+      const customer = transformRecord(records[i], i)
+      if (customer) {
+        customers.push(customer)
+        totalVolume += customer.dailyVolumeNum
+      }
+    }
+
+    console.log(`成功转换 ${customers.length} 条客户数据`)
+
+    return NextResponse.json({
+      customers,
+      stats: {
+        total: customers.length,
+        totalVolume,
+      },
+    })
+
+  } catch (error) {
+    console.error("飞书API错误:", error)
+    return NextResponse.json(
+      {
+        error: String(error),
+        customers: [],
+        stats: { total: 0, totalVolume: 0 },
+      },
+      { status: 500 }
+    )
+  }
+}
